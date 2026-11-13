@@ -289,6 +289,17 @@ class RequiredTests(unittest.TestCase):
         for t in RESUBSCRIBE_TESTS:
             self.assertIn(f"fn {t.rsplit('::', 1)[1]}()", source)
 
+    def test_workflow_names_every_discovery_tid_and_pusher_end_test(self):
+        """Each test the two steps name exists in its source file, in its module."""
+        for path, module, tests in (
+            ("crates/core/src/bc_protocol/connection/discovery.rs", "mod tests {", DISCOVERY_TID_TESTS),
+            ("src/rtsp/factory.rs", "mod pusher_end_tests {", PUSHER_END_TESTS),
+        ):
+            source = (ROOT / path).read_text()
+            self.assertIn(module, source)
+            for t in tests:
+                self.assertIn(f"fn {t.rsplit('::', 1)[1]}()", source)
+
 
 class GstElementCheck(unittest.TestCase):
     """Guard G5: the element check fails when a named element is missing."""
@@ -415,6 +426,27 @@ RESUBSCRIBE_TESTS = [
     )
 ]
 
+# The tests that give each open discovery destination its own tid.
+DISCOVERY_TID_TESTS = [
+    "bc_protocol::connection::discovery::tests::" + name
+    for name in (
+        "every_open_destination_gets_its_own_tid",
+        "new_tid_is_refused_while_all_are_held",
+    )
+]
+
+# The tests that read the warn line a frame pusher leaves when it ends.
+PUSHER_END_TESTS = [
+    "rtsp::factory::pusher_end_tests::" + name
+    for name in (
+        "pusher_error_logs_camera_stream_and_cause_at_warn",
+        "pusher_panic_logs_camera_stream_and_cause_at_warn",
+        "pusher_literal_panic_logs_its_message_at_warn",
+        "pusher_starts_for_a_camera_name_with_a_nul",
+        "pusher_clean_stop_logs_no_warn",
+    )
+]
+
 # Every step whose exit status decides whether estate-test passes, with the exact
 # keys it may carry. A run is compared after collapsing whitespace, so only
 # layout may change. An exact match, not a deny list, is what stops a later
@@ -444,6 +476,16 @@ GATING_STEPS = {
         "if": "${{ !cancelled() }}",
         "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
                + " ".join(f"--require-test {t}" for t in RESUBSCRIBE_TESTS),
+    },
+    ("estate-test", "discovery_tid_tests_ran"): {
+        "if": "${{ !cancelled() }}",
+        "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
+               + " ".join(f"--require-test {t}" for t in DISCOVERY_TID_TESTS),
+    },
+    ("estate-test", "pusher_end_tests_ran"): {
+        "if": "${{ !cancelled() }}",
+        "run": "python3 .github/estate-test/cargo_test_summary.py cargo-test.log "
+               + " ".join(f"--require-test {t}" for t in PUSHER_END_TESTS),
     },
     ("actionlint", "actionlint estate-test.yml"): {
         "run": "./actionlint -color .github/workflows/estate-test.yml",
@@ -537,6 +579,8 @@ class EstateTestWorkflow(unittest.TestCase):
             "cargo test",
             "estate_test_job_runs_core_tests",
             "rtsp_resubscribe_tests_ran",
+            "discovery_tid_tests_ran",
+            "pusher_end_tests_ran",
         )]
         self.assertEqual(order, sorted(order))
 

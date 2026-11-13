@@ -59,6 +59,9 @@ struct UidLookupResults {
 }
 
 const MTU: u32 = 1350;
+/// The tids a request of ours may carry: 8 bits, as neolink has always sent,
+/// without 0, which `subscribe` keeps for replies to no request of ours.
+const TID_RANGE: std::ops::RangeInclusive<u32> = 1..=255;
 lazy_static! {
     static ref P2P_RELAY_HOSTNAMES: [&'static str; 12] = [
         "p2p.reolink.com",
@@ -239,6 +242,31 @@ impl Discoverer {
         }
     }
 
+    /// Reserves a tid that no open request of this discoverer holds, and
+    /// subscribes to its replies. The camera echoes the tid of a request and
+    /// replies are routed by it, so two open requests must never share one.
+    /// The tid is drawn at random among the free tids of `TID_RANGE` under the
+    /// same lock that inserts it, so concurrent requests, such as one per
+    /// destination of local discovery, each get their own. A tid whose
+    /// receiver was dropped is free again. With every tid held, which takes
+    /// more than 255 open requests, this request fails rather than share a
+    /// tid, and the requests already open go on.
+    async fn subscribe_new(&self) -> Result<(u32, Receiver<Result<(UdpDiscovery, SocketAddr)>>)> {
+        let mut subs = self.subsribers.write().await;
+        let held = |tid: &u32| subs.get(tid).is_some_and(|sub| !sub.is_closed());
+        let free: Vec<u32> = TID_RANGE.filter(|tid| !held(tid)).collect();
+        let Some(&tid) = free.choose(&mut thread_rng()) else {
+            log::warn!(
+                "Discovery: all {} tids are held by open requests, so this destination is skipped",
+                TID_RANGE.count()
+            );
+            return Err(Error::Other("No free discovery tid"));
+        };
+        let (tx, rx) = channel(10);
+        subs.insert(tid, tx);
+        Ok((tid, rx))
+    }
+
     /// Subsciber others is for messages that we did not initiate and are therefore
     /// using an unknown tid
     /// In this case we subscribe to tid 0
@@ -275,16 +303,29 @@ impl Discoverer {
     where
         F: Fn(UdpDiscovery, SocketAddr) -> Option<T>,
     {
-        let target_tid = if disc.tid == 0 {
-            // If 0 make a random one
-            let target_tid = generate_tid();
-            disc.tid = target_tid;
-            target_tid
+        let reply = if disc.tid == 0 {
+            // If 0 take a free one
+            let (tid, reply) = self.subscribe_new().await?;
+            disc.tid = tid;
+            reply
         } else {
-            disc.tid
+            self.subscribe(disc.tid).await?
         };
+        self.retry_send_on(reply, disc, dest, map).await
+    }
 
-        let mut reply = ReceiverStream::new(self.subscribe(target_tid).await?);
+    /// As `retry_send`, for a request whose tid is already subscribed.
+    async fn retry_send_on<F, T>(
+        &self,
+        reply: Receiver<Result<(UdpDiscovery, SocketAddr)>>,
+        disc: UdpDiscovery,
+        dest: SocketAddr,
+        map: F,
+    ) -> Result<T>
+    where
+        F: Fn(UdpDiscovery, SocketAddr) -> Option<T>,
+    {
+        let mut reply = ReceiverStream::new(reply);
         let msg = BcUdp::Discovery(disc);
 
         let mut inter = interval(*RESEND_WAIT);
@@ -347,7 +388,7 @@ impl Discoverer {
         client_id: i32,
         addr: SocketAddr,
     ) -> Result<ConnectResult> {
-        let tid = generate_tid();
+        let (tid, reply) = self.subscribe_new().await?;
 
         let port = self.local_addr().port();
         let msg = UdpDiscovery {
@@ -369,7 +410,7 @@ impl Discoverer {
         );
 
         let (camera_address, camera_id) = self
-            .retry_send(msg, addr, |bc, addr| match bc {
+            .retry_send_on(reply, msg, addr, |bc, addr| match bc {
                 UdpDiscovery {
                     tid: _,
                     payload: UdpXml::D2cCr(D2cCr { did, cid, .. }),
@@ -472,7 +513,6 @@ impl Discoverer {
         client_id: i32,
         lookup: &UidLookupResults,
     ) -> Result<RegisterResult> {
-        let tid = generate_tid();
         let local_ip = get_local_ip()?;
         let local_addr = SocketAddr::new(local_ip, self.local_addr().port());
         log::debug!("Registering {:?} to reolink", local_addr);
@@ -481,7 +521,8 @@ impl Discoverer {
         let local_family = if local_addr.ip().is_ipv4() { 4 } else { 6 };
 
         let msg = UdpDiscovery {
-            tid,
+            // retry_send takes a free tid
+            tid: 0,
             payload: UdpXml::C2rC(C2rC {
                 uid: uid.to_string(),
                 cli: IpPort {
@@ -817,9 +858,8 @@ impl Discoverer {
         &self,
         register_result: &RegisterResult,
     ) -> Result<ConnectResult> {
-        let tid = generate_tid();
-
         let dev_addr = register_result.dev.ok_or(Error::NoDev)?;
+        let (tid, reply) = self.subscribe_new().await?;
         let msg = UdpDiscovery {
             tid,
             payload: UdpXml::C2dT(C2dT {
@@ -831,7 +871,7 @@ impl Discoverer {
         };
 
         let (final_addr, local_did) = self
-            .retry_send(msg, dev_addr, |bc, addr| match bc {
+            .retry_send_on(reply, msg, dev_addr, |bc, addr| match bc {
                 UdpDiscovery {
                     tid: _,
                     payload: UdpXml::D2cCfm(D2cCfm { cid, did, sid, .. }),
@@ -880,9 +920,8 @@ impl Discoverer {
         &self,
         register_result: &RegisterResult,
     ) -> Result<ConnectResult> {
-        let tid = generate_tid();
-
         let relay_addr = register_result.relay.ok_or(Error::NoDev)?;
+        let (tid, reply) = self.subscribe_new().await?;
         let msg = UdpDiscovery {
             tid,
             payload: UdpXml::C2dT(C2dT {
@@ -900,7 +939,7 @@ impl Discoverer {
             .await
             .map_err(|_| Error::Other("Discovery already complete"))?;
         let (final_addr, local_did) = self
-            .retry_send(msg, relay_addr, |bc, addr| match bc {
+            .retry_send_on(reply, msg, relay_addr, |bc, addr| match bc {
                 UdpDiscovery {
                     tid: _,
                     payload:
@@ -1561,3 +1600,150 @@ async fn connect() -> Result<UdpSocket> {
     ```
 
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UID: &str = "TESTUID000000000";
+
+    /// Local discovery sends one request per destination, all open at once,
+    /// from one `Discoverer`. Here every destination is a loopback socket and
+    /// there are as many as there are tids, so a tid drawn without regard to
+    /// the open ones repeats with near certainty. A repeat is refused by
+    /// `subscribe`, and that destination never gets its request.
+    ///
+    /// Once every request is open, each camera answers as a real one does,
+    /// with a D2C_C_R that echoes the tid and the cid of the request, and
+    /// again for each resend. Every request must then succeed. A reply that
+    /// carries tid 0 is not routed to its request, so a request that drew
+    /// tid 0 would time out here.
+    #[tokio::test]
+    async fn every_open_destination_gets_its_own_tid() -> Result<()> {
+        fn answer(tid: u32, cid: i32, did: i32) -> BcUdp {
+            BcUdp::Discovery(UdpDiscovery {
+                tid,
+                payload: UdpXml::D2cCr(D2cCr {
+                    timer: Default::default(),
+                    rsp: 0,
+                    cid,
+                    did,
+                }),
+            })
+        }
+
+        let discoverer = Discoverer::new().await?;
+        let mut cameras = vec![];
+        for _ in TID_RANGE {
+            let socket = UdpSocket::bind("127.0.0.1:0").await?;
+            cameras.push(UdpFramed::new(socket, BcUdpCodex::new()));
+        }
+        let dests = cameras
+            .iter()
+            .map(|camera| camera.get_ref().local_addr())
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        let requests = dests
+            .iter()
+            .map(|&dest| discoverer.client_initiated_direct(UID, 7, dest))
+            .collect::<FuturesUnordered<_>>()
+            .collect::<Vec<_>>();
+
+        let cameras_answer = async {
+            let mut tids = BTreeMap::new();
+            let mut asked = vec![];
+            for (n, camera) in cameras.iter_mut().enumerate() {
+                let (msg, from) = timeout(Duration::from_secs(5), camera.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("destination {} of {} got no request", n, dests.len())
+                    })
+                    .expect("socket open")
+                    .expect("a discovery packet");
+                match msg {
+                    BcUdp::Discovery(UdpDiscovery {
+                        tid,
+                        payload: UdpXml::C2dC(C2dC { uid, cid, .. }),
+                    }) => {
+                        assert_eq!(uid, UID);
+                        assert!((1..=255).contains(&tid), "tid {} outside 1..=255", tid);
+                        if let Some(earlier) = tids.insert(tid, n) {
+                            panic!("destinations {} and {} share tid {}", earlier, n, tid);
+                        }
+                        asked.push((tid, cid, from));
+                    }
+                    other => panic!("destination {} got {:?}", n, other),
+                }
+            }
+            cameras
+                .iter_mut()
+                .zip(asked)
+                .enumerate()
+                .map(|(n, (camera, (tid, cid, from)))| async move {
+                    let did = n as i32;
+                    camera
+                        .send((answer(tid, cid, did), from))
+                        .await
+                        .expect("the reply is sent");
+                    while let Some(Ok((msg, from))) = camera.next().await {
+                        if let BcUdp::Discovery(UdpDiscovery {
+                            tid,
+                            payload: UdpXml::C2dC(C2dC { cid, .. }),
+                        }) = msg
+                        {
+                            camera
+                                .send((answer(tid, cid, did), from))
+                                .await
+                                .expect("the reply is sent");
+                        }
+                    }
+                })
+                .collect::<FuturesUnordered<_>>()
+                .collect::<Vec<_>>()
+                .await;
+        };
+
+        let results = timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                _ = cameras_answer => panic!("the cameras stopped answering"),
+                results = requests => results,
+            }
+        })
+        .await
+        .expect("every request ends");
+        assert_eq!(results.len(), dests.len());
+        for result in results {
+            assert!(result.is_ok(), "a request failed: {:?}", result.err());
+        }
+        Ok(())
+    }
+
+    /// With every tid held, a new request fails rather than share a tid,
+    /// and a tid comes free again once its receiver is dropped.
+    #[tokio::test]
+    async fn new_tid_is_refused_while_all_are_held() -> Result<()> {
+        let discoverer = Discoverer::new().await?;
+        let mut held = BTreeMap::new();
+        for _ in TID_RANGE {
+            let (tid, rx) = discoverer.subscribe_new().await?;
+            assert!((1..=255).contains(&tid), "tid {} outside 1..=255", tid);
+            assert!(
+                held.insert(tid, rx).is_none(),
+                "tid {} handed out twice",
+                tid
+            );
+        }
+        assert_eq!(held.len(), 255);
+        assert!(
+            discoverer.subscribe_new().await.is_err(),
+            "a tid was handed out while all {} were held",
+            held.len()
+        );
+
+        let freed = 42;
+        drop(held.remove(&freed));
+        let (tid, _rx) = discoverer.subscribe_new().await?;
+        assert_eq!(tid, freed);
+        Ok(())
+    }
+}

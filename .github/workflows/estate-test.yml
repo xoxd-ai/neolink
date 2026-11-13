@@ -99,6 +99,27 @@ jobs:
           --require-test rtsp::factory::resubscribe_tests::resubscribe_to_a_gone_camera_retries_until_the_client_leaves
           --require-test rtsp::factory::resubscribe_tests::resubscribe_backoff_stops_at_its_max
 
+      # Local discovery gives each open destination its own tid. A frame pusher
+      # that ends on an error or a panic leaves a warn line naming its camera
+      # and stream. Each test is named, so a change that renames, gates or
+      # ignores one fails the job.
+      - name: discovery_tid_tests_ran
+        if: ${{ !cancelled() }}
+        run: >-
+          python3 .github/estate-test/cargo_test_summary.py cargo-test.log
+          --require-test bc_protocol::connection::discovery::tests::every_open_destination_gets_its_own_tid
+          --require-test bc_protocol::connection::discovery::tests::new_tid_is_refused_while_all_are_held
+
+      - name: pusher_end_tests_ran
+        if: ${{ !cancelled() }}
+        run: >-
+          python3 .github/estate-test/cargo_test_summary.py cargo-test.log
+          --require-test rtsp::factory::pusher_end_tests::pusher_error_logs_camera_stream_and_cause_at_warn
+          --require-test rtsp::factory::pusher_end_tests::pusher_panic_logs_camera_stream_and_cause_at_warn
+          --require-test rtsp::factory::pusher_end_tests::pusher_literal_panic_logs_its_message_at_warn
+          --require-test rtsp::factory::pusher_end_tests::pusher_starts_for_a_camera_name_with_a_nul
+          --require-test rtsp::factory::pusher_end_tests::pusher_clean_stop_logs_no_warn
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-24.04

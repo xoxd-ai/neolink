@@ -346,6 +346,42 @@ impl Drop for PusherExit {
     }
 }
 
+/// Starts a frame pusher on a thread named for its camera and stream, so a
+/// panic message names them too. When the pusher ends on an error or a panic,
+/// a warn line names the camera, the stream and the cause. The pusher's own
+/// cleanup, `PusherExit`, runs on both paths as before, so the RTSP client
+/// sees the same end of stream.
+fn spawn_pusher<F>(
+    camera: &str,
+    stream: StreamKind,
+    body: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() -> AnyResult<()> + Send + 'static,
+{
+    let camera = camera.replace('\0', "");
+    std::thread::Builder::new()
+        .name(format!("pusher {camera}::{stream}"))
+        .spawn(
+            move || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!(
+                    "Frame pusher for camera {camera} stream {stream} ended on an error: {e:#}"
+                ),
+                Err(panic) => {
+                    let cause = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("a panic with no message");
+                    log::warn!(
+                        "Frame pusher for camera {camera} stream {stream} ended on a panic: {cause}"
+                    );
+                }
+            },
+        )
+}
+
 enum ClientMsg {
     NewClient {
         element: Element,
@@ -486,7 +522,8 @@ pub(super) async fn make_factory(
                         // be made inside block_on. Made outside, it panics
                         // with "there is no reactor running".
                         let runtime = tokio::runtime::Handle::current();
-                        std::thread::spawn(move || {
+                        let camera_name = name.clone();
+                        let pusher = spawn_pusher(&camera_name, stream, move || {
                             let _exit = PusherExit {
                                 vid_src: vid_src.clone(),
                                 aud_src: aud_src.clone(),
@@ -605,6 +642,11 @@ pub(super) async fn make_factory(
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
                         });
+                        if let Err(e) = pusher {
+                            log::warn!(
+                                "Frame pusher for camera {camera_name} stream {stream} did not start: {e}"
+                            );
+                        }
                         AnyResult::Ok(())
                     });
                 }
@@ -2290,5 +2332,173 @@ mod tests {
             "lead {} us after 30 s",
             last as i64 - wall
         );
+    }
+}
+
+/// A frame pusher ends in one of two ways besides a clean stop: its body
+/// returns an error, or it panics. Each must leave a warn line that names the
+/// camera, the stream and the cause, and the pusher's cleanup must run.
+#[cfg(test)]
+mod pusher_end_tests {
+    use super::spawn_pusher;
+    use anyhow::anyhow;
+    use neolink_core::bc_protocol::StreamKind;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Once,
+    };
+
+    /// Keeps every log record of this test binary, so a test can find the
+    /// lines its own pusher wrote.
+    struct Capture;
+
+    static LINES: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+    static CAPTURE: Capture = Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            LINES
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+        fn flush(&self) {}
+    }
+
+    fn capture_logs() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CAPTURE).expect("no other logger in this test binary");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    fn lines_naming(camera: &str) -> Vec<(log::Level, String)> {
+        LINES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, line)| line.contains(camera))
+            .cloned()
+            .collect()
+    }
+
+    /// Stands in for `PusherExit`: set when the pusher's body is dropped.
+    struct Cleanup(Arc<AtomicBool>);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Runs `body` as a pusher for `camera` on the sub stream, waits for it,
+    /// and returns the name its thread had and whether its cleanup ran.
+    fn run_pusher(
+        camera: &str,
+        body: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) -> (Option<String>, bool) {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let thread_name = Arc::new(Mutex::new(None));
+        let cleanup = Cleanup(cleaned.clone());
+        let seen = thread_name.clone();
+        let handle = spawn_pusher(camera, StreamKind::Sub, move || {
+            let _cleanup = cleanup;
+            *seen.lock().unwrap() = std::thread::current().name().map(str::to_string);
+            body()
+        })
+        .expect("the pusher thread starts");
+        handle
+            .join()
+            .expect("the pusher's end is handled on its own thread");
+        let name = thread_name.lock().unwrap().clone();
+        (name, cleaned.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn pusher_error_logs_camera_stream_and_cause_at_warn() {
+        capture_logs();
+        let (thread_name, cleaned) = run_pusher("yard-err", || {
+            Err(anyhow!("appsrc refused the buffer")).map_err(|e| e.context("push failed"))
+        });
+        assert_eq!(thread_name.as_deref(), Some("pusher yard-err::subStream"));
+        assert!(cleaned, "the pusher's cleanup did not run");
+        let lines = lines_naming("yard-err");
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                "Frame pusher for camera yard-err stream subStream ended on an error: \
+                 push failed: appsrc refused the buffer"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn pusher_panic_logs_camera_stream_and_cause_at_warn() {
+        capture_logs();
+        let (thread_name, cleaned) = run_pusher("yard-panic", || {
+            let frames: Vec<u8> = vec![];
+            panic!("index {} out of range for {} frames", 3, frames.len())
+        });
+        assert_eq!(thread_name.as_deref(), Some("pusher yard-panic::subStream"));
+        assert!(cleaned, "the pusher's cleanup did not run");
+        let lines = lines_naming("yard-panic");
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                "Frame pusher for camera yard-panic stream subStream ended on a panic: \
+                 index 3 out of range for 0 frames"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// A panic on a string literal, as `panic!` with no arguments or
+    /// `Option::unwrap` on `None` gives, carries a `&'static str` and not a
+    /// `String`.
+    #[test]
+    fn pusher_literal_panic_logs_its_message_at_warn() {
+        capture_logs();
+        let (thread_name, cleaned) =
+            run_pusher("yard-literal", || panic!("appsrc has no source pad"));
+        assert_eq!(
+            thread_name.as_deref(),
+            Some("pusher yard-literal::subStream")
+        );
+        assert!(cleaned, "the pusher's cleanup did not run");
+        let lines = lines_naming("yard-literal");
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                "Frame pusher for camera yard-literal stream subStream ended on a panic: \
+                 appsrc has no source pad"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// A thread name may not hold a NUL, and TOML lets a camera name hold
+    /// one. The pusher must still start, under the name without the NUL.
+    #[test]
+    fn pusher_starts_for_a_camera_name_with_a_nul() {
+        capture_logs();
+        let (thread_name, cleaned) = run_pusher("yard\0nul", || Ok(()));
+        assert_eq!(thread_name.as_deref(), Some("pusher yardnul::subStream"));
+        assert!(cleaned, "the pusher's cleanup did not run");
+    }
+
+    #[test]
+    fn pusher_clean_stop_logs_no_warn() {
+        capture_logs();
+        let (_, cleaned) = run_pusher("yard-ok", || Ok(()));
+        assert!(cleaned, "the pusher's cleanup did not run");
+        assert!(lines_naming("yard-ok").is_empty());
     }
 }
