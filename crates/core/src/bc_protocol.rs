@@ -57,6 +57,7 @@ pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
 pub use resolution::*;
+pub use snap::DEFAULT_SNAPSHOT_LIMIT;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind};
 pub use talk::TalkOnBusy;

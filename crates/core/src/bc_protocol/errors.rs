@@ -142,6 +142,20 @@ pub enum Error {
     #[error("The camera is busy with another talk")]
     TalkBusy,
 
+    /// Raised when a snapshot would pass the caller's byte limit, either by
+    /// the size the camera declared for it or by the bytes it sent. `received`
+    /// counts the bytes held when the snapshot was refused, and the bytes that
+    /// would have passed the limit are not among them.
+    #[error("Snapshot refused: camera declared {declared} bytes, {received} bytes received, limit {limit} bytes")]
+    SnapshotTooLarge {
+        /// The picture size in the camera's snap reply
+        declared: usize,
+        /// The bytes held when the snapshot was refused
+        received: usize,
+        /// The caller's limit in bytes
+        limit: usize,
+    },
+
     /// Raised when dicovery times out waiting for a reply
     #[error("Timed out while waiting for camera reply")]
     DiscoveryTimeout,
